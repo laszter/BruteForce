@@ -11,7 +11,7 @@ This is a command-line tool for cracking passwords of PDF files. The tool genera
 1. Clone the repository
 
 ```git
-git clone https://github.com/laszter/bruteforce
+git clone https://github.com/laszter/BruteForce.git
 ```
 
 2. Install Unidoc
