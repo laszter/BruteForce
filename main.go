@@ -6,25 +6,53 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/unidoc/unipdf/v3/model"
 )
 
-func generatePasswords(charset []rune, length int, currentPassword string, passwords chan string) {
-	if length == 0 {
-		passwords <- currentPassword
-	} else {
-		for _, c := range charset {
-			generatePasswords(charset, length-1, currentPassword+string(c), passwords)
+// generatePasswords generates all passwords of the given length iteratively using
+// an index counter, avoiding recursion and repeated string allocations.
+// Returns false if the done signal was received before exhausting all combinations.
+func generatePasswords(charset []byte, length int, passwords chan<- []byte, done <-chan struct{}) bool {
+	n := len(charset)
+	indices := make([]int, length)
+	buf := make([]byte, length)
+
+	for {
+		// Build password from current indices
+		for i, idx := range indices {
+			buf[i] = charset[idx]
+		}
+		pwd := make([]byte, length)
+		copy(pwd, buf)
+
+		select {
+		case <-done:
+			return false
+		case passwords <- pwd:
+		}
+
+		// Increment the index counter (right-to-left, like an odometer)
+		pos := length - 1
+		for pos >= 0 {
+			indices[pos]++
+			if indices[pos] < n {
+				break
+			}
+			indices[pos] = 0
+			pos--
+		}
+		if pos < 0 {
+			return true // exhausted all combinations of this length
 		}
 	}
 }
 
-func worker(_ int, filePath string, passwords <-chan string, found chan<- string, progress chan<- string, wg *sync.WaitGroup, done <-chan struct{}) {
+func worker(filePath string, passwords <-chan []byte, found chan<- string, count *atomic.Int64, last *atomic.Value, wg *sync.WaitGroup, done <-chan struct{}) {
 	defer wg.Done()
 
-	// Each worker opens its own PDF reader
 	f, err := os.Open(filePath)
 	if err != nil {
 		return
@@ -44,16 +72,15 @@ func worker(_ int, filePath string, passwords <-chan string, found chan<- string
 			if !ok {
 				return
 			}
-			// Send progress update
-			select {
-			case progress <- password:
-			default:
-			}
 
-			result, _ := pdfReader.Decrypt([]byte(password))
+			// Update stats atomically — no channel overhead
+			count.Add(1)
+			last.Store(string(password))
+
+			result, _ := pdfReader.Decrypt(password)
 			if result {
 				select {
-				case found <- password:
+				case found <- string(password):
 				case <-done:
 				}
 				return
@@ -79,31 +106,34 @@ func main() {
 	numWorkers := runtime.NumCPU()
 	fmt.Printf("Starting brute force with %d workers...\n", numWorkers)
 
-	characters := []rune("0123456789")
-	passwords := make(chan string, numWorkers*2)
+	characters := []byte("0123456789")
+	// Large buffer so the generator is never blocked waiting for workers
+	passwords := make(chan []byte, numWorkers*500)
 	found := make(chan string, 1)
-	progress := make(chan string, numWorkers*10)
 	done := make(chan struct{})
+
+	var count atomic.Int64
+	var last atomic.Value
 
 	var wg sync.WaitGroup
 
 	// Start workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(i, filePath, passwords, found, progress, &wg, done)
+		go worker(filePath, passwords, found, &count, &last, &wg, done)
 	}
 
-	// Generate passwords
+	// Generate passwords iteratively across increasing lengths
 	go func() {
 		defer close(passwords)
-		length := 1
-		for {
+		for length := 1; ; length++ {
 			select {
 			case <-done:
 				return
 			default:
-				generatePasswords(characters, length, "", passwords)
-				length++
+				if !generatePasswords(characters, length, passwords, done) {
+					return
+				}
 			}
 		}
 	}()
@@ -112,22 +142,17 @@ func main() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	lastPassword := ""
-	passwordCount := 0
-
-	// Monitor progress
+	// Progress display — reads atomic values, no extra goroutine or channel needed
 	go func() {
 		for {
 			select {
 			case <-done:
 				return
-			case pwd := <-progress:
-				lastPassword = pwd
-				passwordCount++
 			case <-ticker.C:
-				if lastPassword != "" {
-					fmt.Printf("\rTrying password: %s (speed: %.0f pwd/s)    ",
-						lastPassword, float64(passwordCount)/time.Since(startTime).Seconds())
+				if pwd, ok := last.Load().(string); ok && pwd != "" {
+					n := count.Load()
+					fmt.Printf("\rTrying: %s (speed: %.0f pwd/s, total: %d)    ",
+						pwd, float64(n)/time.Since(startTime).Seconds(), n)
 				}
 			}
 		}
@@ -139,7 +164,7 @@ func main() {
 	fmt.Printf("\r%s\n", strings.Repeat(" ", 80))
 	fmt.Printf("Password found: %s\n", password)
 	fmt.Printf("Time taken: %s\n", time.Since(startTime))
-	fmt.Printf("Total passwords tested: %d\n", passwordCount)
+	fmt.Printf("Total passwords tested: %d\n", count.Load())
 
 	wg.Wait()
 }
